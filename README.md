@@ -27,7 +27,7 @@ edits.
 
 ```sh
 curl -Lo ~/.local/bin/fix-launcher-icons \
-  https://raw.githubusercontent.com/OWNER/fix-launcher-icons/main/fix-launcher-icons
+  https://raw.githubusercontent.com/eccieshd/fix-launcher-icons/main/fix-launcher-icons
 chmod +x ~/.local/bin/fix-launcher-icons
 ```
 
