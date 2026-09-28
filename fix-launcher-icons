@@ -1,0 +1,402 @@
+#!/usr/bin/env bash
+# fix-launcher-icons — repair blank/generic icons in KDE Plasma's task manager.
+#
+# Fixes two things:
+#   1. .desktop files in ~/.local/share/applications whose Icon= is an absolute
+#      path that doesn't exist (e.g. Flatpak Brave/Chrome/Edge web apps pointing
+#      into ~/.var/app/<id>/data/icons while the icons were installed to
+#      ~/.local/share/icons). Icon= is rewritten to the themed icon name.
+#   2. Task manager pins that point at a raw executable (file:///usr/lib/foo/bin/foo)
+#      instead of a launcher. They are swapped for the matching .desktop launcher.
+#
+# Every modified file is backed up first; see --restore.
+
+set -euo pipefail
+shopt -s nullglob
+
+VERSION=1.0.0
+PROG=fix-launcher-icons
+
+DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
+STATE_HOME=${XDG_STATE_HOME:-$HOME/.local/state}
+DATA_DIRS=${XDG_DATA_DIRS:-/usr/local/share:/usr/share}
+APPLETSRC=$CONFIG_HOME/plasma-org.kde.plasma.desktop-appletsrc
+BACKUP_ROOT=$STATE_HOME/$PROG
+
+mode=ask        # ask | yes | dry
+action=fix      # fix | restore
+restore_dir=
+do_icons=1
+do_pins=1
+quiet=0
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options]
+
+Repair blank launcher icons in KDE Plasma's task manager.
+
+Options:
+  -n, --dry-run        Show what would change, change nothing
+  -y, --yes            Apply without asking
+      --icons-only     Only fix broken Icon= paths in .desktop files
+      --pins-only      Only fix task manager pins that point at executables
+  -q, --quiet          Print nothing unless something changes
+      --install        Copy to ~/.local/bin and watch ~/.local/share/applications,
+                       re-fixing icons whenever a browser rewrites its launchers
+      --uninstall      Remove the watcher and the installed copy
+      --restore [DIR]  Put back files from a backup (default: the latest)
+      --list-backups   List backups
+  -h, --help           Show this help
+  -V, --version        Show version
+EOF
+}
+
+say()  { [[ $quiet == 1 ]] || printf '%s\n' "$*"; }
+warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+die()  { warn "$*"; exit 1; }
+
+# ---------------------------------------------------------------- helpers ---
+
+icon_search_dirs() {
+  local d
+  printf '%s\n' "$DATA_HOME/icons" "$HOME/.icons"
+  IFS=: read -ra dirs <<<"$DATA_DIRS"
+  for d in "${dirs[@]}"; do printf '%s\n' "$d/icons"; done
+  printf '%s\n' "$DATA_HOME/flatpak/exports/share/icons" \
+                /var/lib/flatpak/exports/share/icons /usr/share/pixmaps
+}
+
+# True if a themed icon called $1 is installed somewhere the icon theme looks.
+icon_name_resolves() {
+  local name=$1 dir
+  while read -r dir; do
+    [[ -d $dir ]] || continue
+    if find "$dir/" -maxdepth 4 \( -name "$name.png" -o -name "$name.svg" \
+         -o -name "$name.svgz" -o -name "$name.xpm" \) -print -quit 2>/dev/null | grep -q .; then
+      return 0
+    fi
+  done < <(icon_search_dirs)
+  return 1
+}
+
+application_dirs() {
+  local d
+  printf '%s\n' "$DATA_HOME/applications"
+  IFS=: read -ra dirs <<<"$DATA_DIRS"
+  for d in "${dirs[@]}"; do printf '%s\n' "$d/applications"; done
+  printf '%s\n' "$DATA_HOME/flatpak/exports/share/applications" \
+                /var/lib/flatpak/exports/share/applications
+}
+
+desktop_key() {  # desktop_key FILE KEY -> value from the [Desktop Entry] group
+  awk -v k="$2" '
+    /^\[/ { in_entry = ($0 == "[Desktop Entry]"); next }
+    in_entry && index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }
+  ' "$1"
+}
+
+# First word of Exec=, with quotes and env/flatpak wrappers left alone.
+exec_program() {
+  local exec
+  exec=$(desktop_key "$1" Exec) || return 0
+  exec=${exec%% *}
+  exec=${exec//\"/}
+  exec=${exec//\'/}
+  printf '%s' "$exec"
+}
+
+canonical() { printf '%s/%s' "$(readlink -f "$(dirname "$1")")" "$(basename "$1")"; }
+
+urldecode() { local s=${1//+/ }; printf '%b' "${s//%/\\x}"; }
+
+# Replace every literal occurrence of $2 with $3 in file $1.
+replace_literal() {
+  local tmp
+  tmp=$(mktemp "$1.XXXXXX")
+  OLD=$2 NEW=$3 awk '
+    { out = ""; line = $0
+      while ((i = index(line, ENVIRON["OLD"])) > 0) {
+        out = out substr(line, 1, i - 1) ENVIRON["NEW"]
+        line = substr(line, i + length(ENVIRON["OLD"]))
+      }
+      print out line }
+  ' "$1" >"$tmp"
+  chmod --reference="$1" "$tmp"
+  mv "$tmp" "$1"
+}
+
+backup_dir=
+backup() {  # copy a file into this run's backup, mirroring its absolute path
+  if [[ -z $backup_dir ]]; then
+    backup_dir=$BACKUP_ROOT/backup-$(date +%Y%m%d-%H%M%S)
+    mkdir -p "$backup_dir"
+  fi
+  mkdir -p "$backup_dir$(dirname "$1")"
+  cp -a "$1" "$backup_dir$1"
+}
+
+confirm() {
+  case $mode in
+    yes) return 0 ;;
+    dry) return 1 ;;
+  esac
+  local reply
+  read -rp "$1 [y/N] " reply </dev/tty || return 1
+  [[ $reply == [yY]* ]]
+}
+
+refresh_menu_cache() {
+  command -v update-desktop-database >/dev/null && update-desktop-database -q "$DATA_HOME/applications" 2>/dev/null || true
+  if command -v kbuildsycoca6 >/dev/null; then kbuildsycoca6 >/dev/null 2>&1 || true
+  elif command -v kbuildsycoca5 >/dev/null; then kbuildsycoca5 >/dev/null 2>&1 || true
+  fi
+}
+
+# --------------------------------------------------------- 1. broken icons ---
+
+declare -a icon_files=() icon_old=() icon_new=()
+
+scan_icons() {
+  local f icon name candidate
+  for f in "$DATA_HOME"/applications/*.desktop; do
+    icon=$(desktop_key "$f" Icon)
+    [[ $icon == /* && ! -e $icon ]] || continue
+
+    name=$(basename "$icon"); name=${name%.*}
+    candidate=
+    if icon_name_resolves "$name"; then
+      candidate=$name
+    elif [[ $icon == "$HOME"/.var/app/*/data/* ]]; then
+      # Sandbox path -> the same path on the host
+      local host=$DATA_HOME/${icon#"$HOME"/.var/app/*/data/}
+      [[ -e $host ]] && candidate=$host
+    fi
+
+    if [[ -n $candidate ]]; then
+      icon_files+=("$f"); icon_old+=("$icon"); icon_new+=("$candidate")
+    else
+      say "  ! $(basename "$f"): icon $icon is missing and no replacement was found"
+    fi
+  done
+}
+
+apply_icons() {
+  local i f
+  for i in "${!icon_files[@]}"; do
+    f=${icon_files[i]}
+    backup "$f"
+    replace_literal "$f" "Icon=${icon_old[i]}" "Icon=${icon_new[i]}"
+  done
+  refresh_menu_cache
+}
+
+# ------------------------------------------------ 2. pins to executables ---
+
+declare -a pin_old=() pin_new=()
+
+# Find the one launcher whose program is $1. Exact path match wins; otherwise a
+# unique match on the program's name. Prints the desktop file id or nothing.
+launcher_for_executable() {
+  local target=$1 real base dir f prog id
+  local -a exact=() by_name=()
+  # Resolve the directory but keep the name: multi-call binaries (VMware's
+  # appLoader, busybox, ...) share one target and pick behaviour from argv[0].
+  real=$(canonical "$target")
+  base=$(basename "$target")
+  declare -A seen=()
+
+  while read -r dir; do
+    for f in "$dir"/*.desktop; do
+      id=$(basename "$f")
+      [[ -n ${seen[$id]:-} ]] && continue   # earlier dirs shadow later ones
+      seen[$id]=1
+      [[ $(desktop_key "$f" NoDisplay) == true || $(desktop_key "$f" Hidden) == true ]] && continue
+      prog=$(exec_program "$f")
+      [[ -n $prog ]] || continue
+      if [[ $prog == /* ]] && [[ $(canonical "$prog") == "$real" ]]; then
+        exact+=("$id")
+      elif [[ $(basename "$prog") == "$base" ]]; then
+        by_name+=("$id")
+      fi
+    done
+  done < <(application_dirs)
+
+  if (( ${#exact[@]} == 1 )); then printf '%s' "${exact[0]}"
+  elif (( ${#exact[@]} == 0 && ${#by_name[@]} == 1 )); then printf '%s' "${by_name[0]}"
+  fi
+}
+
+scan_pins() {
+  [[ -f $APPLETSRC ]] || return 0
+  local line entry path id
+  while IFS= read -r line; do
+    IFS=, read -ra entries <<<"${line#launchers=}"
+    for entry in "${entries[@]}"; do
+      [[ $entry == file://* ]] || continue
+      path=$(urldecode "${entry#file://}")
+      [[ $path == *.desktop || ! -f $path || ! -x $path ]] && continue
+      [[ " ${pin_old[*]} " == *" $entry "* ]] && continue
+      id=$(launcher_for_executable "$path")
+      if [[ -n $id ]]; then
+        pin_old+=("$entry"); pin_new+=("applications:$id")
+      else
+        say "  ! pinned $path: no single matching launcher found, leaving it"
+      fi
+    done
+  done < <(grep '^launchers=' "$APPLETSRC")
+}
+
+apply_pins() {
+  # Plasma writes its config back on exit, so edit it only while it's stopped.
+  local restart=${FLI_NO_PLASMA_RESTART:+no}
+  local i
+  if [[ $restart != no ]]; then
+    systemctl --user stop plasma-plasmashell 2>/dev/null || kquitapp6 plasmashell 2>/dev/null || true
+  fi
+  backup "$APPLETSRC"
+  local map="" tmp
+  for i in "${!pin_old[@]}"; do map+="${pin_old[i]}"$'\t'"${pin_new[i]}"$'\n'; done
+  tmp=$(mktemp "$APPLETSRC.XXXXXX")
+  MAP=$map awk '
+    BEGIN { n = split(ENVIRON["MAP"], rows, "\n")
+            for (r = 1; r <= n; r++) if (split(rows[r], kv, "\t") == 2) to[kv[1]] = kv[2] }
+    index($0, "launchers=") == 1 {
+      m = split(substr($0, 11), e, ","); out = ""
+      for (j = 1; j <= m; j++) out = out (j > 1 ? "," : "") (e[j] in to ? to[e[j]] : e[j])
+      print "launchers=" out; next }
+    { print }
+  ' "$APPLETSRC" >"$tmp"
+  chmod --reference="$APPLETSRC" "$tmp"
+  mv "$tmp" "$APPLETSRC"
+  if [[ $restart != no ]]; then
+    systemctl --user start plasma-plasmashell 2>/dev/null || (setsid plasmashell >/dev/null 2>&1 &)
+  fi
+}
+
+# ------------------------------------------------------ install / restore ---
+
+install_self() {
+  local bin=$HOME/.local/bin/$PROG units=$CONFIG_HOME/systemd/user
+  mkdir -p "$(dirname "$bin")" "$units"
+  cp "$(readlink -f "$0")" "$bin"; chmod +x "$bin"
+
+  cat >"$units/$PROG.service" <<EOF
+[Unit]
+Description=Repair broken launcher icons
+
+[Service]
+Type=oneshot
+ExecStart=$bin --icons-only --yes --quiet
+EOF
+  cat >"$units/$PROG.path" <<EOF
+[Unit]
+Description=Watch launchers for broken icons
+
+[Path]
+PathChanged=$DATA_HOME/applications
+TriggerLimitIntervalSec=10
+TriggerLimitBurst=5
+
+[Install]
+WantedBy=default.target
+EOF
+  systemctl --user daemon-reload
+  systemctl --user enable --now "$PROG.path"
+  say "Installed $bin and enabled $PROG.path"
+  say "Icons will be re-fixed whenever something changes in $DATA_HOME/applications."
+}
+
+uninstall_self() {
+  systemctl --user disable --now "$PROG.path" 2>/dev/null || true
+  rm -f "$CONFIG_HOME/systemd/user/$PROG.path" "$CONFIG_HOME/systemd/user/$PROG.service" \
+        "$HOME/.local/bin/$PROG"
+  systemctl --user daemon-reload
+  say "Removed the watcher and $HOME/.local/bin/$PROG (backups kept in $BACKUP_ROOT)"
+}
+
+list_backups() {
+  local d
+  for d in "$BACKUP_ROOT"/backup-*/; do
+    printf '%s\n' "${d%/}"
+    (cd "$d" && find . -type f | sed 's|^\.|    |')
+  done
+}
+
+restore() {
+  local dir=${1:-} rel
+  if [[ -z $dir ]]; then
+    local all=("$BACKUP_ROOT"/backup-*/)
+    (( ${#all[@]} )) || die "no backups in $BACKUP_ROOT"
+    dir=${all[-1]%/}
+  fi
+  [[ -d $dir ]] || die "no such backup: $dir"
+  say "Restoring from $dir:"
+  (cd "$dir" && find . -type f) | while read -r rel; do say "  ${rel#.}"; done
+  confirm "Restore these files?" || { say "Nothing restored."; return; }
+  local touches_plasma=0
+  [[ -e $dir$APPLETSRC ]] && touches_plasma=1
+  [[ $touches_plasma == 1 && -z ${FLI_NO_PLASMA_RESTART:-} ]] && systemctl --user stop plasma-plasmashell 2>/dev/null || true
+  (cd "$dir" && find . -type f) | while read -r rel; do cp -a "$dir/${rel#./}" "/${rel#./}"; done
+  [[ $touches_plasma == 1 && -z ${FLI_NO_PLASMA_RESTART:-} ]] && systemctl --user start plasma-plasmashell 2>/dev/null || true
+  refresh_menu_cache
+  say "Restored."
+}
+
+# ------------------------------------------------------------------- main ---
+
+while (( $# )); do
+  case $1 in
+    -n|--dry-run)   mode=dry ;;
+    -y|--yes)       mode=yes ;;
+    --icons-only)   do_pins=0 ;;
+    --pins-only)    do_icons=0 ;;
+    -q|--quiet)     quiet=1 ;;
+    --install)      install_self; exit ;;
+    --uninstall)    uninstall_self; exit ;;
+    --list-backups) list_backups; exit ;;
+    --restore)      action=restore
+                    if [[ ${2:-} && $2 != -* ]]; then restore_dir=$2; shift; fi ;;
+    -h|--help)      usage; exit ;;
+    -V|--version)   echo "$PROG $VERSION"; exit ;;
+    *)              usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if [[ $action == restore ]]; then restore "$restore_dir"; exit; fi
+
+# No terminal to ask on and no --yes: just report.
+[[ $mode == ask && ! -r /dev/tty ]] && mode=dry
+
+(( do_icons )) && scan_icons
+(( do_pins )) && scan_pins
+
+if (( ${#icon_files[@]} == 0 && ${#pin_old[@]} == 0 )); then
+  say "Nothing to fix."
+  exit 0
+fi
+
+quiet=0
+if (( ${#icon_files[@]} )); then
+  say "Launchers with a missing icon file:"
+  for i in "${!icon_files[@]}"; do
+    say "  $(desktop_key "${icon_files[i]}" Name)  ($(basename "${icon_files[i]}"))"
+    say "    ${icon_old[i]}"
+    say "    -> ${icon_new[i]}"
+  done
+fi
+if (( ${#pin_old[@]} )); then
+  say "Task manager pins pointing at a program instead of a launcher:"
+  for i in "${!pin_old[@]}"; do say "  ${pin_old[i]}  ->  ${pin_new[i]}"; done
+  say "  (Plasma's panel will restart to apply this.)"
+fi
+
+if confirm "Apply these fixes?"; then
+  (( ${#icon_files[@]} )) && apply_icons
+  (( ${#pin_old[@]} )) && apply_pins
+  say "Done. Backup: $backup_dir  (undo with: $PROG --restore)"
+else
+  [[ $mode == dry ]] && say "Dry run, nothing changed." || say "Nothing changed."
+fi
